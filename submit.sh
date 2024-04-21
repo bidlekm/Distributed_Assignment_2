@@ -5,4 +5,5 @@
 
 module load gcc/12.2.0 openmpi/4.1.4
 make
-time -p mpirun -n 8 ./stencil input96.txt output96.txt 4
+mpirun -n 8 ./stencil input96.txt output96_1.txt 1
+mpirun -n 8 ./stencil input96.txt output96_2.txt 2
