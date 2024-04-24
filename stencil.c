@@ -124,7 +124,6 @@ int main(int argc, char **argv)
 			local_output = tmp;
 		}
 	}
-
 	// Stop timer
 	double my_execution_time = MPI_Wtime() - start;
 
