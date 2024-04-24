@@ -2,126 +2,156 @@
 
 int main(int argc, char **argv)
 {
-	int rank, size;
-    MPI_Status status;
+
 	MPI_Init(&argc, &argv);
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-	if (4 != argc)
-	{
-		printf("Usage: stencil input_file output_file number_of_applications\n");
-		return 1;
-	}
-	char *input_name = argv[1];
-	char *output_name = argv[2];
-	int num_steps = atoi(argv[3]);
+	int rank, size;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-	// Read input file
-	double *input;
+	double *input = NULL;
 	int num_values;
-
-	//TODO: start timer before or after the inputs are read in
-	// Start timer
-	double start = MPI_Wtime();
-	if(rank == 0)
+	int num_steps;
+	char *output_name;
+	char *input_name = argv[1];
+	output_name = argv[2];
+	num_steps = atoi(argv[3]);
+	if (rank == 0)
 	{
+		if (4 != argc)
+		{
+			printf("Usage: stencil input_file output_file number_of_applications\n");
+			return 1;
+		}
+		// Read input file
 		if (0 > (num_values = read_input(input_name, &input)))
 		{
-			perror("Couldn't allocate memory for input in process 0");
 			return 2;
-			//TODO: MPI_Finalize(); and cancel all other threads
 		}
-		
 	}
+
+	// Broadcast num_values
+	MPI_Bcast(&num_values, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+	// Scatter input
+	int local_num_values = num_values / size;
+	double *local_input = malloc(local_num_values * sizeof(double));
+	MPI_Scatter(input, local_num_values, MPI_DOUBLE, local_input, local_num_values, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
 	// Stencil values
 	double h = 2.0 * PI / num_values;
 	const int STENCIL_WIDTH = 5;
 	const int EXTENT = STENCIL_WIDTH / 2;
 	const double STENCIL[] = {1.0 / (12 * h), -8.0 / (12 * h), 0.0, 8.0 / (12 * h), -1.0 / (12 * h)};
-	const int dataPerProcess = num_values / size;
-	const int localBufferSize = dataPerProcess + 2*EXTENT;
-	double* localBuffer = (double*) malloc(localBufferSize * sizeof(double));
-	if(rank == 0)
+	double leftBoundary[EXTENT];
+	double rightBoundary[EXTENT];
+
+	// Allocate data for result
+	double *output;
+	if (rank == 0)
 	{
-
-		//"inner" processes
-		for(int i = 1; i < size - 1; ++i)
+		if (NULL == (output = malloc(num_values * sizeof(double))))
 		{
-			MPI_Send(&input[i*dataPerProcess-EXTENT],localBufferSize, MPI_DOUBLE, rank, 0, MPI_COMM_WORLD);
-		}
-
-		//rightmost process buffer
-		for(int i = 0; i < localBufferSize; ++i)
-		{
-			//reuse of buffer: use own local buffer to send data, rewrite with own data later
-			localBuffer[i] = input[(((size - 1) * dataPerProcess) + i - EXTENT) % num_values];
-			MPI_Send(&localBuffer,localBufferSize, MPI_DOUBLE, size - 1 , 0, MPI_COMM_WORLD);
-		}
-		//leftmost process buffer (rank 0)
-		for(int i = 0; i < localBufferSize; ++i)
-		{
-			localBuffer[i] = input[(i - EXTENT) % num_values];
+			perror("Couldn't allocate memory for output in rank 0");
+			return 2;
 		}
 	}
-	else
-	{
-    	MPI_Recv(localBuffer, localBufferSize, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status);
-	}
-	
-	//set up persistent communication with neighboring processes
-	MPI_Request receiveRight;
-	MPI_Request receiveLeft;
-	MPI_Request sendRight;
-	MPI_Request sendLeft;
-	
-	double* sendBuffer = (double*)malloc(EXTENT * sizeof(double));
-	double* receiveBuffer = (double*)malloc(EXTENT * sizeof(double));
 
-	MPI_Recv_init(receiveBuffer, EXTENT, MPI_DOUBLE, (rank + size - 1) % size, 0, MPI_COMM_WORLD, &receiveRight);
-	MPI_Recv_init(&receiveBuffer[EXTENT], EXTENT, MPI_DOUBLE, (rank + 1) % size, 0, MPI_COMM_WORLD, &receiveLeft);
+	double *local_output = malloc(local_num_values * sizeof(double));
 
-	MPI_Send_init(sendBuffer, EXTENT, MPI_DOUBLE, (rank + size - 1) % size, 0, MPI_COMM_WORLD, &sendRight);
-	MPI_Send_init(&sendBuffer[EXTENT], EXTENT, MPI_DOUBLE, (rank + 1) % size, 0, MPI_COMM_WORLD, &sendLeft);
+
+	MPI_Request leftRequest, rightRequest;
+	MPI_Status leftStatus, rightStatus;
+
+
+	// Start timer
+	double start = MPI_Wtime();
 
 	// Repeatedly apply stencil
 	for (int s = 0; s < num_steps; s++)
 	{
-		// Apply stencil
-		for (int i = 0; i < num_values; i++)
+		start -= MPI_Wtime();	
+		// Send left and right boundary
+		MPI_Isend(&local_input[0], EXTENT, MPI_DOUBLE, (rank - 1 + size) % size, 0, MPI_COMM_WORLD, &leftRequest);
+		MPI_Isend(&local_input[local_num_values - EXTENT], EXTENT, MPI_DOUBLE, (rank + 1) % size, 0, MPI_COMM_WORLD, &rightRequest);
+
+		// Receive left and right boundary
+		MPI_Irecv(&rightBoundary[0], EXTENT, MPI_DOUBLE, (rank + 1) % size, 0, MPI_COMM_WORLD, &rightRequest);
+		MPI_Irecv(&leftBoundary[0], EXTENT, MPI_DOUBLE, (rank - 1 + size) % size, 0, MPI_COMM_WORLD, &leftRequest);
+		start += MPI_Wtime();
+		for (int i = EXTENT; i < local_num_values - EXTENT; i++)
 		{
 			double result = 0;
 			for (int j = 0; j < STENCIL_WIDTH; j++)
 			{
-				int index = (i - EXTENT + j + num_values) % num_values;
-				result += STENCIL[j] * input[index];
+				int index = i - EXTENT + j;
+				result += STENCIL[j] * local_input[index];
 			}
-			output[i] = result;
+			local_output[i] = result;
+		}
+		start -= MPI_Wtime();
+		MPI_Wait(&leftRequest, &leftStatus);
+		MPI_Wait(&rightRequest, &rightStatus);
+		start += MPI_Wtime();
+		for (int i = 0; i < EXTENT; i++)
+		{
+			double result = 0;
+			for (int j = 0; j < STENCIL_WIDTH; j++)
+			{
+				int index = i - EXTENT + j;
+				double value = (index < 0) ? leftBoundary[EXTENT + index] : local_input[index];
+				result += STENCIL[j] * value;
+			}
+			local_output[i] = result;
+		}
+
+		for (int i = local_num_values - EXTENT; i < local_num_values; i++)
+		{
+			double result = 0;
+			for (int j = 0; j < STENCIL_WIDTH; j++)
+			{
+				int index = i - EXTENT + j;
+				double value = (index >= local_num_values) ? rightBoundary[index - local_num_values] : local_input[index];
+				result += STENCIL[j] * value;
+			}
+			local_output[i] = result;
 		}
 		// Swap input and output
 		if (s < num_steps - 1)
 		{
-			double *tmp = input;
-			input = output;
-			output = tmp;
+			double *tmp = local_input;
+			local_input = local_output;
+			local_output = tmp;
 		}
 	}
-	if(rank == 0)
-	{
-			free(input);
-		// Stop timer
-		double my_execution_time = MPI_Wtime() - start;
 
-		// Write result
-		printf("%f\n", my_execution_time);
+	// Stop timer
+	double my_execution_time = MPI_Wtime() - start;
+
+	// Gather output
+	MPI_Gather(local_output, local_num_values, MPI_DOUBLE, output, local_num_values, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+	// // Write result
+	// printf("%f\n", my_execution_time);
 #ifdef PRODUCE_OUTPUT_FILE
-		if (0 != write_output(output_name, input, num_values))
-		{
-			return 2;
-		}
-#endif
+	if (rank == 0 && 0 != write_output(output_name, output, num_values))
+	{
+		return 2;
 	}
+#endif
+
+	if (rank == 0)
+	{
+		printf("%f\n", my_execution_time);
+		free(output);
+		free(input);
+	}
+
+
+	free(local_output);
+	free(local_input);
 	MPI_Finalize();
+
 	return 0;
 }
 
